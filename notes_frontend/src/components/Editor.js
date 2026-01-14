@@ -1,11 +1,11 @@
-import React, { useMemo, useRef } from "react";
+import React, { memo, useMemo, useRef } from "react";
 import { formatRelativeTime } from "../utils/date";
 
 /**
  * Editor for selected note.
  */
 // PUBLIC_INTERFACE
-export default function Editor({
+function EditorImpl({
   noteId,
   title,
   body,
@@ -104,10 +104,7 @@ export default function Editor({
               Updated <strong>{formatRelativeTime(updatedAt)}</strong>
             </span>
             {isDirty ? " • Unsaved changes" : " • Saved"}
-            <span className="editorSubMeta">
-              {" "}
-              • Created {formatRelativeTime(createdAt)}
-            </span>
+            <span className="editorSubMeta"> • Created {formatRelativeTime(createdAt)}</span>
           </div>
         </div>
 
@@ -192,3 +189,23 @@ export default function Editor({
     </>
   );
 }
+
+// Memo: editor should only rerender when its props change (not on sidebar search/sort updates).
+// PUBLIC_INTERFACE
+const Editor = memo(EditorImpl, (prev, next) => {
+  return (
+    prev.noteId === next.noteId &&
+    prev.title === next.title &&
+    prev.body === next.body &&
+    prev.isDirty === next.isDirty &&
+    prev.createdAt === next.createdAt &&
+    prev.updatedAt === next.updatedAt &&
+    prev.onTitleChange === next.onTitleChange &&
+    prev.onBodyChange === next.onBodyChange &&
+    prev.onSave === next.onSave &&
+    prev.onDuplicate === next.onDuplicate &&
+    prev.onClearSelection === next.onClearSelection
+  );
+});
+
+export default Editor;

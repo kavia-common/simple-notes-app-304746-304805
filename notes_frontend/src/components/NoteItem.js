@@ -1,13 +1,16 @@
-import React from "react";
+import React, { memo, useMemo } from "react";
 import { formatRelativeTime } from "../utils/date";
 
 /**
  * Single row in the notes list.
  */
 // PUBLIC_INTERFACE
-export default function NoteItem({ note, selected, active, onSelect, onDelete, onActive }) {
-  const snippet = (note.body || "").replace(/\s+/g, " ").trim().slice(0, 60);
-  const title = (note.title || "").trim() || "Untitled note";
+function NoteItemImpl({ note, selected, active, onSelect, onDelete, onActive }) {
+  const title = useMemo(() => (note.title || "").trim() || "Untitled note", [note.title]);
+  const snippet = useMemo(
+    () => (note.body || "").replace(/\s+/g, " ").trim().slice(0, 60),
+    [note.body]
+  );
 
   return (
     <div
@@ -17,7 +20,14 @@ export default function NoteItem({ note, selected, active, onSelect, onDelete, o
       onFocus={onActive}
       onMouseEnter={onActive}
       onKeyDown={(e) => {
-        if (e.key === "Enter" || e.key === " ") onSelect();
+        if (e.key === "Enter") {
+          onSelect();
+        }
+        if (e.key === " ") {
+          // Prevent page scroll when using Space to activate.
+          e.preventDefault();
+          onSelect();
+        }
       }}
       tabIndex={0}
       aria-label={`Note: ${title}`}
@@ -44,3 +54,7 @@ export default function NoteItem({ note, selected, active, onSelect, onDelete, o
     </div>
   );
 }
+
+// PUBLIC_INTERFACE
+const NoteItem = memo(NoteItemImpl);
+export default NoteItem;

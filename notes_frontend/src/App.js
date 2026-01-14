@@ -9,6 +9,7 @@ import { useHotkeys } from "./hooks/useHotkeys";
 import { formatRelativeTime } from "./utils/date";
 import { loadJson, saveJson } from "./utils/storage";
 import { normalizeNote } from "./utils/note";
+import { downloadNotesJson, mergeNotesById, parseNotesImportFile } from "./utils/notesTransfer";
 
 /**
  * Notes app shell: sidebar list + main editor, with autosave and toasts.
@@ -46,6 +47,27 @@ function App() {
   // Sidebar keyboard UX: keep an "active" (highlighted) id separate from selected id.
   const [activeSidebarId, setActiveSidebarId] = useState(null);
 
+  // Undo delete state (single-level): keep last deleted note for ~6–10 seconds.
+  const [lastDeleted, setLastDeleted] = useState(null);
+  const undoTimerRef = useRef(null);
+  const UNDO_WINDOW_MS = 8000;
+
+  const clearUndoState = () => {
+    if (undoTimerRef.current) {
+      window.clearTimeout(undoTimerRef.current);
+      undoTimerRef.current = null;
+    }
+    setLastDeleted(null);
+  };
+
+  const armUndoTimeout = () => {
+    if (undoTimerRef.current) window.clearTimeout(undoTimerRef.current);
+    undoTimerRef.current = window.setTimeout(() => {
+      setLastDeleted(null);
+      undoTimerRef.current = null;
+    }, UNDO_WINDOW_MS);
+  };
+
   // Restore prefs (search query + sort mode) once on mount.
   useEffect(() => {
     const prefs = loadJson(PREFS_KEY, {});
@@ -57,7 +79,6 @@ function App() {
 
     setQuery(nextQuery);
     setSortMode(nextSortMode);
-    // If a user had a search query, the list will filter on first render naturally.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -196,6 +217,9 @@ function App() {
   }, [selectedNote?.id]); // only on selection changes
 
   const handleCreate = async () => {
+    // Any new action should clear lastDeleted (per requirement).
+    clearUndoState();
+
     try {
       const created = await notesService.createNote({
         title: "Untitled note",
@@ -226,8 +250,6 @@ function App() {
   };
 
   const handleSelect = (id) => {
-    // Cancel any pending autosave for the previously selected note immediately.
-    // This avoids a save racing after selection changes.
     clearAutosaveTimer();
     autosaveNoteIdRef.current = String(id);
     setSelectedId(id);
@@ -245,12 +267,53 @@ function App() {
     return remaining.length ? remaining[0].id : null;
   };
 
+  const handleUndoDelete = async () => {
+    if (!lastDeleted?.note) return;
+
+    const noteToRestore = normalizeNote(lastDeleted.note);
+    // Clear immediately so repeated clicks don't create duplicates.
+    clearUndoState();
+
+    try {
+      // Create a new note then (best-effort) update it to match the deleted content.
+      // This works in both local and REST modes without requiring a "restore by id" endpoint.
+      const created = await notesService.createNote({
+        title: noteToRestore.title || "Untitled note",
+        body: noteToRestore.body || "",
+      });
+
+      // Some services may already accept our title/body; still update to ensure exact match.
+      if (created?.id) {
+        await notesService.updateNote(created.id, {
+          title: noteToRestore.title || "Untitled note",
+          body: noteToRestore.body || "",
+        });
+        setSelectedId(created.id);
+        setActiveSidebarId(created.id);
+      }
+
+      await loadNotes({ preserveOnFailure: true });
+
+      pushToast({ kind: "success", title: "Restored", message: "Note restored." });
+    } catch (e) {
+      pushToast({
+        kind: "danger",
+        title: "Undo failed",
+        message: e?.message || "Could not restore note.",
+      });
+      await loadNotes({ preserveOnFailure: true });
+    }
+  };
+
   const handleDelete = async (id) => {
     const note = notes.find((n) => n.id === id);
     const ok = window.confirm(
-      `Delete "${note?.title?.trim() || "Untitled note"}"? This cannot be undone.`
+      `Delete "${note?.title?.trim() || "Untitled note"}"? This can be undone for a few seconds.`
     );
     if (!ok) return;
+
+    // New delete replaces any previous lastDeleted window.
+    clearUndoState();
 
     const deletingSelected = selectedId === id;
     const nextSelection = deletingSelected ? computeNextSelectionAfterDelete(id) : selectedId;
@@ -271,10 +334,20 @@ function App() {
         setSelectedId(nextSelection);
       }
 
+      // Arm undo for the last deleted note and show toast with action.
+      setLastDeleted({ note: normalizeNote(note), deletedAt: Date.now() });
+      armUndoTimeout();
+
       // Best-effort refresh to reconcile with backend/storage.
       await loadNotes({ preserveOnFailure: true });
 
-      pushToast({ kind: "danger", title: "Deleted", message: "Note deleted." });
+      pushToast({
+        kind: "danger",
+        title: "Deleted",
+        message: "Note deleted.",
+        durationMs: UNDO_WINDOW_MS,
+        action: { label: "Undo", ariaLabel: "Undo delete", onClick: handleUndoDelete },
+      });
     } catch (e) {
       pushToast({
         kind: "danger",
@@ -283,12 +356,14 @@ function App() {
       });
 
       // If delete failed, do NOT clear selection or drafts.
-      // Attempt to refresh list (best-effort) without wiping current UI state.
       await loadNotes({ preserveOnFailure: true });
     }
   };
 
   const handleSave = async ({ silent, noteIdOverride } = { silent: false }) => {
+    // Save is a "new action" that should clear lastDeleted.
+    clearUndoState();
+
     const note = selectedNote;
     const noteId = noteIdOverride || note?.id;
 
@@ -317,11 +392,9 @@ function App() {
       // Only apply update if we're still viewing the same note id.
       setNotes((prev) => prev.map((n) => (n.id === updated?.id ? updated : n)));
 
-      // Also keep selection stable (should already be), and clear dirty state on success.
       setIsDirty(false);
       if (!silent) pushToast({ kind: "success", title: "Saved", message: "Your note is saved." });
     } catch (e) {
-      // Preserve draft content and selection on failure.
       pushToast({
         kind: "danger",
         title: "Save failed",
@@ -331,6 +404,8 @@ function App() {
   };
 
   const handleDuplicate = async () => {
+    clearUndoState();
+
     if (!selectedNote) return;
     try {
       const baseTitle = (selectedNote.title || "").trim() || "Untitled note";
@@ -362,6 +437,8 @@ function App() {
   };
 
   const handleToggleSort = () => {
+    clearUndoState();
+
     setSortMode((prev) => {
       const next = prev === "updated_desc" ? "title_asc" : "updated_desc";
       pushToast({
@@ -373,6 +450,71 @@ function App() {
     });
   };
 
+  const handleDownloadJson = () => {
+    try {
+      downloadNotesJson(notes, "simple-notes");
+      pushToast({ kind: "success", title: "Exported", message: "Download started." });
+    } catch (e) {
+      pushToast({
+        kind: "danger",
+        title: "Export failed",
+        message: e?.message || "Could not export notes.",
+      });
+    }
+  };
+
+  const handleImportFile = async (file) => {
+    clearUndoState();
+
+    try {
+      const imported = await parseNotesImportFile(file);
+      const { merged, stats } = mergeNotesById(notes, imported);
+
+      // Persist merge results back to the active service.
+      // We use create/update methods to keep compatibility with both local and REST modes.
+      const existingById = new Map(notes.map((n) => [String(n.id), n]));
+      let createdCount = 0;
+      let updatedCount = 0;
+
+      // Note: This is intentionally sequential for safety/compatibility.
+      // A future improvement could parallelize for large imports.
+      for (const n of merged) {
+        const id = String(n.id);
+        const existed = existingById.get(id);
+
+        if (!existed) {
+          await notesService.createNote({ title: n.title || "Untitled note", body: n.body || "" });
+          createdCount += 1;
+          continue;
+        }
+
+        const existedUpdated = typeof existed.updatedAt === "number" ? existed.updatedAt : 0;
+        const nextUpdated = typeof n.updatedAt === "number" ? n.updatedAt : 0;
+
+        if (nextUpdated > existedUpdated) {
+          await notesService.updateNote(id, { title: n.title || "Untitled note", body: n.body || "" });
+          updatedCount += 1;
+        }
+      }
+
+      await loadNotes({ preserveOnFailure: true });
+
+      pushToast({
+        kind: "success",
+        title: "Import complete",
+        message: `Imported ${stats.imported}. Added ${createdCount}, updated ${updatedCount}, skipped ${stats.skipped}.`,
+        durationMs: 4000,
+      });
+    } catch (e) {
+      pushToast({
+        kind: "danger",
+        title: "Import failed",
+        message: e?.message || "Could not import notes.",
+        durationMs: 4000,
+      });
+    }
+  };
+
   // Keyboard UX
   useHotkeys({
     onSave: () => handleSave({ silent: false }),
@@ -382,12 +524,17 @@ function App() {
   const lastUpdatedLabel = selectedNote ? formatRelativeTime(selectedNote.updatedAt) : null;
   const storageModeLabel = notesService.mode === "api" ? "API" : "Local";
 
+  const isTrulyEmpty = notes.length === 0;
+  const noResults = notes.length > 0 && filteredNotes.length === 0;
+
   return (
     <div className="App">
       <Header
         modeLabel={storageModeLabel}
         selectedLastUpdated={lastUpdatedLabel}
         hasSelection={Boolean(selectedNote)}
+        onDownloadJson={handleDownloadJson}
+        onImportFile={handleImportFile}
       />
 
       <main className="appShell">
@@ -409,13 +556,55 @@ function App() {
           {!selectedNote ? (
             <div className="emptyState">
               <div className="emptyCard">
-                <div className="emptyTitle">Select a note</div>
-                <div className="emptyBody">
-                  Create a new note or pick one from the sidebar to start editing.
-                </div>
-                <button className="btn primary" onClick={handleCreate} type="button">
-                  Create note
-                </button>
+                {isTrulyEmpty ? (
+                  <>
+                    <div className="emptyTitle">Welcome to Simple Notes</div>
+                    <div className="emptyBody">
+                      Create your first note, or import notes from a JSON file.
+                    </div>
+                    <div className="emptyActions">
+                      <button
+                        className="btn primary"
+                        onClick={handleCreate}
+                        type="button"
+                        aria-label="Create your first note"
+                      >
+                        Create note
+                      </button>
+                      <button
+                        className="btn"
+                        onClick={() => {
+                          // Trigger header file input by dispatching a click on the hidden input via the header button.
+                          // This keeps architecture simple; user can also use the header Import button.
+                          document
+                            .querySelector('input[type="file"].fileInput')
+                            ?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+                        }}
+                        type="button"
+                        aria-label="Import notes from file"
+                      >
+                        Import from file
+                      </button>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <div className="emptyTitle">{noResults ? "No matches" : "Select a note"}</div>
+                    <div className="emptyBody">
+                      {noResults
+                        ? "Try a different search, or clear the filter to see all notes."
+                        : "Create a new note or pick one from the sidebar to start editing."}
+                    </div>
+                    <button
+                      className="btn primary"
+                      onClick={handleCreate}
+                      type="button"
+                      aria-label="Create note"
+                    >
+                      Create note
+                    </button>
+                  </>
+                )}
               </div>
             </div>
           ) : (

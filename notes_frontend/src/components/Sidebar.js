@@ -1,5 +1,6 @@
-import React, { useEffect, useMemo, useRef } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import NoteItem from "./NoteItem";
+import { useDebouncedValue } from "../hooks/useDebouncedValue";
 
 /**
  * Sidebar with search/filter, create button, and notes list.
@@ -19,6 +20,16 @@ export default function Sidebar({
   onActiveChange,
 }) {
   const listRef = useRef(null);
+
+  // Local (immediate) input state for responsive typing; app-level filtering is debounced.
+  const [localQuery, setLocalQuery] = useState(query ?? "");
+  useEffect(() => setLocalQuery(query ?? ""), [query]);
+
+  const debouncedQuery = useDebouncedValue(localQuery, 200);
+  useEffect(() => {
+    // Only propagate when the debounced value changes.
+    onQueryChange?.(debouncedQuery);
+  }, [debouncedQuery, onQueryChange]);
 
   const idToIndex = useMemo(() => {
     const map = new Map();
@@ -80,7 +91,10 @@ export default function Sidebar({
           <button
             className="btn ghost"
             type="button"
-            onClick={() => onQueryChange("")}
+            onClick={() => {
+              setLocalQuery("");
+              onQueryChange?.("");
+            }}
             aria-label="Clear search"
             title="Clear search"
           >
@@ -90,8 +104,8 @@ export default function Sidebar({
 
         <input
           className="search"
-          value={query}
-          onChange={(e) => onQueryChange(e.target.value)}
+          value={localQuery}
+          onChange={(e) => setLocalQuery(e.target.value)}
           placeholder="Search notes…"
           aria-label="Search notes"
         />
