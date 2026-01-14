@@ -1,4 +1,4 @@
-import React from "react";
+import React, { useEffect, useMemo, useRef } from "react";
 import NoteItem from "./NoteItem";
 
 /**
@@ -8,19 +8,75 @@ import NoteItem from "./NoteItem";
 export default function Sidebar({
   notes,
   selectedId,
+  activeId,
   query,
+  sortMode,
   onQueryChange,
+  onToggleSort,
   onCreate,
   onSelect,
   onDelete,
+  onActiveChange,
 }) {
+  const listRef = useRef(null);
+
+  const idToIndex = useMemo(() => {
+    const map = new Map();
+    notes.forEach((n, idx) => map.set(n.id, idx));
+    return map;
+  }, [notes]);
+
+  useEffect(() => {
+    // Ensure the active item stays visible when keyboard navigating.
+    if (!activeId) return;
+    const el = listRef.current?.querySelector(`[data-note-id="${CSS.escape(String(activeId))}"]`);
+    el?.scrollIntoView?.({ block: "nearest" });
+  }, [activeId]);
+
+  const sortLabel = sortMode === "title_asc" ? "Title (A→Z)" : "Updated (desc)";
+
+  const handleListKeyDown = (e) => {
+    if (notes.length === 0) return;
+
+    // Only handle navigation keys; allow others to bubble.
+    if (e.key !== "ArrowDown" && e.key !== "ArrowUp" && e.key !== "Enter") return;
+
+    // Avoid page scroll from arrow keys.
+    e.preventDefault();
+
+    const currentId = activeId ?? selectedId ?? notes[0].id;
+    const currentIdx = idToIndex.get(currentId);
+    const safeIdx = typeof currentIdx === "number" ? currentIdx : 0;
+
+    if (e.key === "Enter") {
+      onSelect(notes[safeIdx].id);
+      return;
+    }
+
+    const delta = e.key === "ArrowDown" ? 1 : -1;
+    const nextIdx = Math.min(notes.length - 1, Math.max(0, safeIdx + delta));
+    const nextId = notes[nextIdx].id;
+    onActiveChange?.(nextId);
+  };
+
   return (
     <aside className="sidebar" aria-label="Notes sidebar">
       <div className="sidebarTop">
         <div className="sidebarActions">
-          <button className="btn primary" onClick={onCreate} type="button">
+          <button className="btn primary" onClick={onCreate} type="button" aria-label="Create note">
             + New
           </button>
+
+          <button
+            className="btn"
+            type="button"
+            onClick={onToggleSort}
+            aria-label="Toggle sort mode"
+            title="Toggle sort mode"
+          >
+            Sort: {sortLabel}
+          </button>
+
           <button
             className="btn ghost"
             type="button"
@@ -41,7 +97,14 @@ export default function Sidebar({
         />
       </div>
 
-      <div className="notesList" role="list">
+      <div
+        ref={listRef}
+        className="notesList"
+        role="list"
+        tabIndex={0}
+        aria-label="Notes list"
+        onKeyDown={handleListKeyDown}
+      >
         {notes.length === 0 ? (
           <div style={{ padding: 10, color: "rgba(17, 24, 39, 0.64)", fontSize: 13 }}>
             No notes found.
@@ -52,8 +115,10 @@ export default function Sidebar({
               key={n.id}
               note={n}
               selected={n.id === selectedId}
+              active={n.id === activeId}
               onSelect={() => onSelect(n.id)}
               onDelete={() => onDelete(n.id)}
+              onActive={() => onActiveChange?.(n.id)}
             />
           ))
         )}

@@ -7,6 +7,8 @@ import ToastViewport from "./components/ToastViewport";
 import { useNotesService } from "./hooks/useNotesService";
 import { useHotkeys } from "./hooks/useHotkeys";
 import { formatRelativeTime } from "./utils/date";
+import { loadJson, saveJson } from "./utils/storage";
+import { normalizeNote } from "./utils/note";
 
 /**
  * Notes app shell: sidebar list + main editor, with autosave and toasts.
@@ -22,9 +24,12 @@ import { formatRelativeTime } from "./utils/date";
 function App() {
   const notesService = useNotesService();
 
+  const PREFS_KEY = "notes.prefs.v1";
+
   const [notes, setNotes] = useState([]);
   const [selectedId, setSelectedId] = useState(null);
   const [query, setQuery] = useState("");
+  const [sortMode, setSortMode] = useState("updated_desc"); // updated_desc | title_asc
   const [toasts, setToasts] = useState([]);
 
   // Draft state for editor (source of truth for user input while editing)
@@ -38,21 +43,77 @@ function App() {
   // Prevents a stale timer from saving to the wrong note after selection changes.
   const autosaveNoteIdRef = useRef(null);
 
+  // Sidebar keyboard UX: keep an "active" (highlighted) id separate from selected id.
+  const [activeSidebarId, setActiveSidebarId] = useState(null);
+
+  // Restore prefs (search query + sort mode) once on mount.
+  useEffect(() => {
+    const prefs = loadJson(PREFS_KEY, {});
+    const nextQuery = typeof prefs?.query === "string" ? prefs.query : "";
+    const nextSortMode =
+      prefs?.sortMode === "updated_desc" || prefs?.sortMode === "title_asc"
+        ? prefs.sortMode
+        : "updated_desc";
+
+    setQuery(nextQuery);
+    setSortMode(nextSortMode);
+    // If a user had a search query, the list will filter on first render naturally.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Persist prefs on change (kept small and versioned).
+  useEffect(() => {
+    saveJson(PREFS_KEY, { query, sortMode });
+  }, [query, sortMode]);
+
   const selectedNote = useMemo(
     () => notes.find((n) => n.id === selectedId) || null,
     [notes, selectedId]
   );
 
+  const sortedNotes = useMemo(() => {
+    const list = [...notes];
+
+    if (sortMode === "title_asc") {
+      return list.sort((a, b) => {
+        const ta = (a.title || "").trim().toLowerCase() || "untitled note";
+        const tb = (b.title || "").trim().toLowerCase() || "untitled note";
+        if (ta < tb) return -1;
+        if (ta > tb) return 1;
+        // Stable tie-breaker: updated desc
+        return (b.updatedAt ?? 0) - (a.updatedAt ?? 0);
+      });
+    }
+
+    // Default: updated desc
+    return list.sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0));
+  }, [notes, sortMode]);
+
   const filteredNotes = useMemo(() => {
     const q = query.trim().toLowerCase();
-    const list = [...notes].sort((a, b) => b.updatedAt - a.updatedAt);
-    if (!q) return list;
-    return list.filter((n) => {
+    if (!q) return sortedNotes;
+    return sortedNotes.filter((n) => {
       const t = (n.title || "").toLowerCase();
       const b = (n.body || "").toLowerCase();
       return t.includes(q) || b.includes(q);
     });
-  }, [notes, query]);
+  }, [sortedNotes, query]);
+
+  // Keep activeSidebarId coherent with current list + selection.
+  useEffect(() => {
+    // Prefer keeping the current selection active if it's in the filtered list.
+    if (selectedId && filteredNotes.some((n) => n.id === selectedId)) {
+      setActiveSidebarId(selectedId);
+      return;
+    }
+    // Otherwise, keep existing active if still present.
+    if (activeSidebarId && filteredNotes.some((n) => n.id === activeSidebarId)) {
+      return;
+    }
+    // Otherwise, fall back to first visible note.
+    setActiveSidebarId(filteredNotes[0]?.id ?? null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filteredNotes, selectedId]);
 
   const pushToast = (toast) => {
     const id = crypto?.randomUUID?.() ?? String(Date.now() + Math.random());
@@ -170,6 +231,7 @@ function App() {
     clearAutosaveTimer();
     autosaveNoteIdRef.current = String(id);
     setSelectedId(id);
+    setActiveSidebarId(String(id));
   };
 
   const handleClearSelection = () => {
@@ -179,8 +241,7 @@ function App() {
   };
 
   const computeNextSelectionAfterDelete = (deletedId) => {
-    const sorted = [...notes].sort((a, b) => b.updatedAt - a.updatedAt);
-    const remaining = sorted.filter((n) => n.id !== deletedId);
+    const remaining = filteredNotes.filter((n) => n.id !== deletedId);
     return remaining.length ? remaining[0].id : null;
   };
 
@@ -241,10 +302,7 @@ function App() {
     const titleToSave = trimmedTitle.length ? trimmedTitle : "Untitled note";
 
     // Avoid needless writes when nothing changed
-    if (
-      titleToSave === (note.title ?? "") &&
-      (draftBody ?? "") === (note.body ?? "")
-    ) {
+    if (titleToSave === (note.title ?? "") && (draftBody ?? "") === (note.body ?? "")) {
       setIsDirty(false);
       if (!silent) pushToast({ kind: "info", title: "Saved", message: "No changes to save." });
       return;
@@ -272,6 +330,49 @@ function App() {
     }
   };
 
+  const handleDuplicate = async () => {
+    if (!selectedNote) return;
+    try {
+      const baseTitle = (selectedNote.title || "").trim() || "Untitled note";
+      const copyTitle = `${baseTitle} (Copy)`;
+      const created = await notesService.createNote({
+        title: copyTitle,
+        body: selectedNote.body ?? "",
+      });
+
+      if (created?.id) {
+        setNotes((prev) => {
+          const existing = prev.some((n) => n.id === created.id);
+          return existing ? prev : [created, ...prev];
+        });
+        setSelectedId(created.id);
+        setActiveSidebarId(created.id);
+      }
+
+      await loadNotes({ preserveOnFailure: true });
+
+      pushToast({ kind: "success", title: "Duplicated", message: "Note duplicated." });
+    } catch (e) {
+      pushToast({
+        kind: "danger",
+        title: "Duplicate failed",
+        message: e?.message || "Could not duplicate note.",
+      });
+    }
+  };
+
+  const handleToggleSort = () => {
+    setSortMode((prev) => {
+      const next = prev === "updated_desc" ? "title_asc" : "updated_desc";
+      pushToast({
+        kind: "info",
+        title: "Sort",
+        message: next === "updated_desc" ? "Sorting by Updated (desc)." : "Sorting by Title (A→Z).",
+      });
+      return next;
+    });
+  };
+
   // Keyboard UX
   useHotkeys({
     onSave: () => handleSave({ silent: false }),
@@ -293,11 +394,15 @@ function App() {
         <Sidebar
           notes={filteredNotes}
           selectedId={selectedId}
+          activeId={activeSidebarId}
           query={query}
+          sortMode={sortMode}
           onQueryChange={setQuery}
+          onToggleSort={handleToggleSort}
           onCreate={handleCreate}
           onSelect={handleSelect}
           onDelete={handleDelete}
+          onActiveChange={setActiveSidebarId}
         />
 
         <section className="mainPanel" aria-label="Note editor panel">
@@ -319,6 +424,7 @@ function App() {
               title={draftTitle}
               body={draftBody}
               isDirty={isDirty}
+              createdAt={selectedNote.createdAt}
               updatedAt={selectedNote.updatedAt}
               onTitleChange={(v) => {
                 setDraftTitle(v);
@@ -331,6 +437,7 @@ function App() {
                 scheduleAutosave();
               }}
               onSave={() => handleSave({ silent: false })}
+              onDuplicate={handleDuplicate}
               onEnterInTitleFocusBody
               onClearSelection={handleClearSelection}
             />
