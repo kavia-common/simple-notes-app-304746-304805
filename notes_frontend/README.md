@@ -4,27 +4,37 @@ This is a lightweight single-page notes application built with React. It runs fu
 
 ## Storage modes (local vs REST API)
 
-The app selects the notes “service” at runtime:
+The app selects the notes “service” at runtime (see `src/hooks/useNotesService.js`):
 
-- If `REACT_APP_API_BASE` or `REACT_APP_BACKEND_URL` is set (non-empty after trimming), the app runs in **REST API mode**.
-- Otherwise, it runs in **Local mode** using `window.localStorage`.
+If `REACT_APP_API_BASE` or `REACT_APP_BACKEND_URL` is set (and is non-empty after trimming whitespace), the app runs in REST API mode. Otherwise, it runs in local mode backed by `window.localStorage`. The active mode is shown in the header (Mode: Local / API).
 
-This selection is implemented in `src/hooks/useNotesService.js`, and the UI displays the active mode in the header (Mode: Local / API).
+## Environment variables and base URL wiring
 
-### Environment variables
+REST mode is controlled by these environment variables:
 
-The following variables control REST mode:
+`REACT_APP_API_BASE` is the preferred base URL for the REST API. `REACT_APP_BACKEND_URL` is a fallback base URL for the REST API used only when `REACT_APP_API_BASE` is not set.
 
-- `REACT_APP_API_BASE`: Preferred base URL for the REST API (for example, `http://localhost:8080`).
-- `REACT_APP_BACKEND_URL`: Fallback base URL for the REST API if `REACT_APP_API_BASE` is not set.
+In code, the base URL is selected as:
 
-If both are set, `REACT_APP_API_BASE` takes precedence.
+1. `process.env.REACT_APP_API_BASE`, otherwise
+2. `process.env.REACT_APP_BACKEND_URL`, otherwise
+3. an empty string (meaning local mode)
 
-Important: Create React App only exposes variables prefixed with `REACT_APP_`. You must restart the dev server after changing environment variables.
+The chosen base URL is then coerced to a string and trimmed. If the trimmed base URL is empty, REST mode is disabled and the app uses localStorage.
+
+Important: Create React App only exposes environment variables prefixed with `REACT_APP_`. You must restart the dev server after changing environment variables.
 
 ## REST API contract
 
-When REST mode is enabled, the frontend expects a JSON REST API with the following endpoints. Returned note objects are normalized client-side into the canonical shape shown below.
+When REST mode is enabled, the frontend expects a JSON REST API with these endpoints (implemented by the frontend client in `src/services/restNotesService.js`):
+
+- `GET /notes`
+- `POST /notes`
+- `GET /notes/:id`
+- `PUT /notes/:id`
+- `DELETE /notes/:id`
+
+Returned note objects are normalized client-side into the canonical shape shown below.
 
 ### Canonical Note shape
 
@@ -40,64 +50,69 @@ All notes used by the UI conform to this shape:
 }
 ```
 
-The timestamps are Unix epoch milliseconds. The backend may return strings or other timestamp formats; the app will normalize as best it can.
+The timestamps are Unix epoch milliseconds. The backend may return strings, numbers, or other timestamp formats; the app normalizes them on a best-effort basis.
 
 ### Endpoints
 
 #### List notes
 
-- `GET /notes`
-- Response: JSON array of notes
+`GET /notes`
+
+The response should be a JSON array of notes.
 
 Example response:
 
 ```json
 [
-  { "id": "1", "title": "A", "body": "B", "createdAt": 1700000000000, "updatedAt": 1700000001000 }
+  {
+    "id": "1",
+    "title": "A",
+    "body": "B",
+    "createdAt": 1700000000000,
+    "updatedAt": 1700000001000
+  }
 ]
 ```
 
 #### Create note
 
-- `POST /notes`
-- Request body:
+`POST /notes`
+
+The request body is JSON:
 
 ```json
 { "title": "string", "body": "string" }
 ```
 
-- Response: JSON note (recommended). If the response is missing timestamps, the frontend will fill them.
-
-Example response:
-
-```json
-{ "id": "123", "title": "New", "body": "", "createdAt": 1700000000000, "updatedAt": 1700000000000 }
-```
+The response should be the created JSON note (recommended). If the response is missing timestamps, the frontend fills them with the current time. If the response omits some fields, the frontend uses request values as fallback.
 
 #### Get note
 
-- `GET /notes/:id`
-- Response: JSON note (or `null`/404 depending on your implementation)
+`GET /notes/:id`
+
+The response should be a JSON note, or it can be `null` / 404 depending on your backend implementation. The frontend will treat a non-JSON response as `null`.
 
 #### Update note
 
-- `PUT /notes/:id`
-- Request body:
+`PUT /notes/:id`
+
+The request body is JSON:
 
 ```json
 { "title": "string", "body": "string" }
 ```
 
-- Response: JSON note (recommended). If fields are missing, the frontend will use request fields and timestamps as fallback.
+The response should be the updated JSON note (recommended). If the response omits fields, the frontend uses request fields and timestamps as fallback.
 
 #### Delete note
 
-- `DELETE /notes/:id`
-- Response: any 2xx. The frontend accepts empty responses.
+`DELETE /notes/:id`
 
-### Base URL joining rules
+Any 2xx response is accepted. The frontend accepts an empty body (and generally ignores non-JSON delete responses).
 
-The REST service joins the configured base URL and paths safely by removing duplicate slashes.
+### How the base URL is used
+
+All REST calls are constructed from the selected base URL plus the endpoint path, using a safe join that removes duplicate slashes.
 
 Examples:
 
@@ -105,9 +120,9 @@ Examples:
 - `REACT_APP_API_BASE=http://localhost:8080/` + `/notes` becomes `http://localhost:8080/notes`
 - `REACT_APP_API_BASE=https://api.example.com/v1` + `/notes/123` becomes `https://api.example.com/v1/notes/123`
 
-## CORS and different origins
+## CORS and connecting to external APIs
 
-In development, the React dev server runs on `http://localhost:3000`. If your API is on a different origin (for example `http://localhost:8080`), your backend must allow cross-origin requests.
+In development, the React dev server runs on `http://localhost:3000`. If your REST API is on a different origin (for example `http://localhost:8080` or `https://api.example.com`), the backend must allow cross-origin requests from the frontend origin.
 
 At minimum, configure your backend to include appropriate CORS headers, such as:
 
@@ -115,17 +130,17 @@ At minimum, configure your backend to include appropriate CORS headers, such as:
 - `Access-Control-Allow-Headers: Content-Type`
 - `Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS`
 
-Because the frontend uses `fetch` with `Content-Type: application/json`, your backend should also handle preflight `OPTIONS` requests for `POST` and `PUT`.
+Because the frontend uses `fetch` with `Content-Type: application/json`, your backend should also handle CORS preflight `OPTIONS` requests for at least `POST` and `PUT` (and often `DELETE`).
 
 ## Failure and fallback behavior
 
 This repository ships fully functional without any backend.
 
-When REST mode is enabled and a REST call fails (network error, non-2xx HTTP status, invalid JSON, etc.), the UI is designed to remain stable:
+The app has two distinct “fallback” concepts:
 
-- Errors are surfaced via toast notifications (for example, “Load failed”, “Save failed”, “Delete failed”).
-- The app preserves current notes, selection, and drafts on transient failures wherever possible, to avoid losing user input.
-- Local mode continues to work offline and is the default when no API base URL is configured.
+If `REACT_APP_API_BASE` and `REACT_APP_BACKEND_URL` are both absent (or only contain whitespace), the app always uses localStorage mode.
+
+If REST mode is enabled but a REST call fails (network error, non-2xx HTTP status, invalid JSON, etc.), the app displays a toast error and attempts to keep the UI stable by preserving current notes, selection, and drafts wherever possible. In this situation, the app does not automatically switch to localStorage, but you can force local mode by unsetting the REST env vars and restarting the dev server.
 
 ## Quick start
 
@@ -149,13 +164,24 @@ Open `http://localhost:3000`.
 # Example: macOS/Linux
 export REACT_APP_API_BASE="http://localhost:8080"
 npm start
+```
 
-# Example: Windows PowerShell
+On Windows PowerShell:
+
+```powershell
 $env:REACT_APP_API_BASE="http://localhost:8080"
 npm start
 ```
 
-Alternatively, you can set `REACT_APP_BACKEND_URL` instead of `REACT_APP_API_BASE`.
+Alternatively, you can set `REACT_APP_BACKEND_URL` instead of `REACT_APP_API_BASE` (it has lower precedence).
+
+## Troubleshooting
+
+If the header still shows Mode: Local after setting `REACT_APP_API_BASE`, confirm that the variable name starts with `REACT_APP_` and that you restarted the dev server. Also ensure it is not an empty/whitespace-only string, because the app trims before deciding whether REST mode is enabled.
+
+If you see CORS errors in the browser console, your API is rejecting cross-origin requests from `http://localhost:3000`. Configure the backend’s CORS settings and ensure it responds correctly to `OPTIONS` preflight requests.
+
+If you see “HTTP 404” or “HTTP 500” errors in toast notifications, verify that your base URL does not already include an incompatible path prefix, and confirm that your backend implements the required endpoints exactly (including `/notes/:id`).
 
 ## Learn More
 
@@ -171,7 +197,7 @@ This section has moved here: [https://facebook.github.io/create-react-app/docs/a
 
 ### Making a Progressive Web App
 
-This section has moved here: [https://facebook.github.io/create-react-app/docs/making-a-progressive-web-app](https://facebook.github.io/create-react-app/docs/making-a-progressive-web-app)
+This section has moved here: [https://facebook.github.io/create-react-app/docs/making-a-progressive-web-app](https://facebook.github.io/create-react-app/docs/making-a-progressive web-app)
 
 ### Advanced Configuration
 
